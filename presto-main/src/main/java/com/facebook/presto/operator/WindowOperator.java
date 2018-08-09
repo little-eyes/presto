@@ -28,6 +28,7 @@ import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.common.primitives.Ints;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.OptionalInt;
@@ -173,6 +174,10 @@ public class WindowOperator
     private final PagesHashStrategy preSortedPartitionHashStrategy;
     private final PagesHashStrategy peerGroupHashStrategy;
 
+    private final List<Type> sourceTypes;
+    private final int expectedPositions;
+    private final PagesIndex.Factory pagesIndexFactory;
+
     private final PagesIndex pagesIndex;
 
     private final PageBuilder pageBuilder;
@@ -226,6 +231,9 @@ public class WindowOperator
                         .map(WindowFunctionDefinition::getType))
                 .collect(toImmutableList());
 
+        this.sourceTypes = sourceTypes;
+        this.expectedPositions = expectedPositions;
+        this.pagesIndexFactory = pagesIndexFactory;
         this.pagesIndex = pagesIndexFactory.newPagesIndex(sourceTypes, expectedPositions);
         this.preGroupedChannels = Ints.toArray(preGroupedChannels);
         this.preGroupedPartitionHashStrategy = pagesIndex.createPagesHashStrategy(preGroupedChannels, OptionalInt.empty());
@@ -328,6 +336,39 @@ public class WindowOperator
         }
     }
 
+    WorkProcessor<PagesIndex> producePagesIndex(
+            WorkProcessor<Page> pages)
+    {
+        PagesIndex pagesIndex = pagesIndexFactory.newPagesIndex(sourceTypes, expectedPositions);
+
+        return pages.flatMap(page -> {
+            checkArgument(page.getPositionCount() > 0);
+
+            return WorkProcessor.create(new WorkProcessor.Process<PagesIndex>()
+            {
+                @Override
+                public WorkProcessor.ProcessorState<PagesIndex> process()
+                {
+                    Page preGroupedPage = rearrangePage(page, preGroupedChannels);
+                    if (pagesIndex.getPositionCount() == 0
+                            || pagesIndex.positionEqualsRow(
+                                    preGroupedPartitionHashStrategy,
+                            0,
+                            0,
+                            preGroupedPage)) {
+                        // Find the position where the pre-grouped columns change
+                        int groupEnd = findGroupEnd(preGroupedPage, preGroupedPartitionHashStrategy, 0);
+
+                        // Add the section of the page that contains values for the current group
+                        pagesIndex.addPage(page.getRegion(0, groupEnd));
+                    }
+
+                    return WorkProcessor.ProcessorState.ofResult(pagesIndex);
+                }
+            });
+        });
+    }
+
     /**
      * @return the unused section of the page, or null if fully applied.
      * pagesIndex guaranteed to have at least one row after this method returns
@@ -367,6 +408,34 @@ public class WindowOperator
             newBlocks[i] = page.getBlock(channels[i]);
         }
         return new Page(page.getPositionCount(), newBlocks);
+    }
+
+    // Extract all partitions from current pagesIndex
+    // This method does not try to extract partitions from current
+    // pending input
+    private WorkProcessor<List<WindowPartition>> producePartitions(
+            PagesIndex pagesIndex)
+    {
+        return WorkProcessor.create(new WorkProcessor.Process<List<WindowPartition>>()
+        {
+            //TODO: add ImmutableList instead?
+            @Override
+            public WorkProcessor.ProcessorState<List<WindowPartition>> process()
+            {
+                List<WindowPartition> windowPartitions = new ArrayList<>();
+
+                int partitionStart = 0;
+
+                while (partitionStart < pagesIndex.getPositionCount()) {
+                    int partitionEnd = findGroupEnd(pagesIndex, unGroupedPartitionHashStrategy, partitionStart);
+                    WindowPartition currentPartition = new WindowPartition(pagesIndex, partitionStart, partitionEnd, outputChannels, windowFunctions, peerGroupHashStrategy);
+                    windowInfo.addPartition(currentPartition);
+                    windowPartitions.add(currentPartition);
+                }
+
+                return WorkProcessor.ProcessorState.ofResult(windowPartitions);
+            }
+        });
     }
 
     @Override
@@ -428,6 +497,44 @@ public class WindowOperator
         return page;
     }
 
+    // Produces one full page of results
+    private WorkProcessor<Page> produceWindowResultsPerPartition(
+            WorkProcessor<List<WindowPartition>> windowPartitions) {
+        return windowPartitions.flatMap(windowPartitionList -> {
+            return WorkProcessor.create(new WorkProcessor.Process<Page>() {
+                @Override
+                public WorkProcessor.ProcessorState<Page> process()
+                {
+                    if (state == State.FINISHING) {
+                        state = State.FINISHED;
+
+                        // Output the remaining page if we have anything buffered
+                        if (!pageBuilder.isEmpty()) {
+                            Page page = pageBuilder.build();
+                            pageBuilder.reset();
+                            return WorkProcessor.ProcessorState.ofResult(page);
+                        }
+                    }
+
+                    for (int i = 0; i < windowPartitionList.size(); i++) {
+                        if (pageBuilder.isFull()) {
+                            break;
+                        }
+
+                        windowPartitionList.get(i).processNextRow(pageBuilder);
+                    }
+
+                    if (!pageBuilder.isFull()) {
+                        state = State.NEEDS_INPUT;
+                        return WorkProcessor.ProcessorState.needsMoreData();
+                    }
+
+                    return WorkProcessor.ProcessorState.ofResult(pageBuilder.build());
+                }
+            });
+        });
+    }
+
     private void sortPagesIndexIfNecessary()
     {
         if (pagesIndex.getPositionCount() > 1 && !orderChannels.isEmpty()) {
@@ -440,10 +547,40 @@ public class WindowOperator
         }
     }
 
+    private WorkProcessor<PagesIndex> produceSortedPagesIndexIfNecessary(
+            WorkProcessor<PagesIndex> pagesIndex)
+    {
+        return pagesIndex.transform(currentPagesIndex -> {
+            checkArgument(currentPagesIndex.isPresent(), "pagesIndex should not be null");
+            if (currentPagesIndex.get().getPositionCount() > 1 && !orderChannels.isEmpty()) {
+                int startPosition = 0;
+                while (startPosition < currentPagesIndex.get().getPositionCount()) {
+                    int endPosition = findGroupEnd(currentPagesIndex.get(), preSortedPartitionHashStrategy, startPosition);
+                    currentPagesIndex.get().sort(orderChannels, ordering, startPosition, endPosition);
+                    startPosition = endPosition;
+                }
+            }
+
+            return WorkProcessor.ProcessorState.ofResult(currentPagesIndex.get());
+        });
+    }
+
     private void finishPagesIndex()
     {
         sortPagesIndexIfNecessary();
         windowInfo.addIndex(pagesIndex);
+    }
+
+    private WorkProcessor<PagesIndex> produceFinishedPagesIndex(WorkProcessor<PagesIndex> pagesIndex)
+    {
+        WorkProcessor<PagesIndex> resultPagesIndex = produceSortedPagesIndexIfNecessary(pagesIndex);
+
+        return resultPagesIndex.transform(currentResultPagesIndex -> {
+            checkArgument(currentResultPagesIndex.isPresent(), "PagesIndex should not be null");
+            windowInfo.addIndex(currentResultPagesIndex.get());
+
+            return WorkProcessor.ProcessorState.ofResult(currentResultPagesIndex.get());
+        });
     }
 
     // Assumes input grouped on relevant pagesHashStrategy columns
